@@ -40,12 +40,20 @@
 #define MAP_MASK (MAP_SIZE - 1)
 
 #define ADMIN_QUEUE_DEPTH 0x1F
+#define IO_QUEUE_DEPTH 32
 
 volatile uint32_t admin_sq_tl[32];
 volatile uint32_t admin_cq_hd[32];
 uint8_t phase_bit[32];
 uint16_t command_id[32];
 volatile uint64_t ssd_virt_base[32];
+
+
+// [ssd_id][qid]
+static uint16_t io_sq_tail[32][256];
+static uint16_t io_cq_head[32][256];
+static uint8_t  io_phase_bit[32][256];
+static uint16_t io_command_id[32][256];
 
 
 uint64_t queue_phys_base;
@@ -87,61 +95,6 @@ void print_cq(int offset, int length) {
 }
 
 
-static uint64_t virt_to_phys(void *addr) {
-    // /proc/self/pagemap 열기
-    int fd = open("/proc/self/pagemap", O_RDONLY);
-    if (fd < 0) {
-        perror("open pagemap");
-        return 0;
-    }
-
-    // 페이지 단위 인덱스
-    uint64_t vaddr = (uint64_t)addr;
-    uint64_t index = vaddr >> 12; // 4KB 단위
-    printf("vaddr: 0x%lx, index: 0x%lx\n", vaddr, index);
-
-    // offset: pagemap에서 index가 가리키는 위치
-    uint64_t offset = index * 8; // 8바이트 당 하나의 엔트리
-    printf("offset: 0x%lx\n", offset);
-    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
-        perror("lseek");
-        close(fd);
-        return 0;
-    }
-
-    uint64_t pagemap_val = 0;
-    if (read(fd, &pagemap_val, 8) != 8) {
-        perror("read");
-        close(fd);
-        return 0;
-    }
-    close(fd);
-
-    // pagemap_val에서 PFN 추출 (하위 55비트)
-    uint64_t pfn = pagemap_val & 0x7fffffffffffffULL; 
-    printf("pfn: 0x%lx\n", pfn);
-
-    int hugepage = 0;
-    if (pfn != 0 && ((uint64_t)addr % HUGEPAGE_SIZE == 0)) {
-        hugepage = 1;
-    }
-    else {
-        return -1;
-    }
-
-    // present bit 검사 (pfn이 0이 아니거나, pagemap_val의 다른 비트 체크)
-    // huge page의 경우에도 present면 pfn에 값이 있을 것
-    // 페이지 내부 offset
-    // uint64_t offset_in_page = vaddr & 0xFFF;
-    uint64_t offset_in_page = vaddr & (HUGEPAGE_SIZE - 1);
-    printf("offset in page: 0x%lx\n", offset_in_page);
-
-    // 실제 물리 주소 = (PFN << 12) + 페이지 내 offset
-    uint64_t paddr = (pfn << 12) | offset_in_page;
-    printf("physical address: 0x%lx\n", paddr);
-    return paddr;
-}
-
 int wait_for_next_cqe(int ssd_id)
 {
     // Calculate the starting address of command.
@@ -157,19 +110,9 @@ int wait_for_next_cqe(int ssd_id)
         current_phase = ((current_phase >> 16) & 0x1);
     }   while (current_phase == unexpected_phase);
 
-    // int current_phase = command_base[3] >> 16 & 0x1;  
-
-
-    // while (current_phase == unexpected_phase)
-    // {
-    //     // printf("current_phase: %d, unexpected_phase: %d\n", current_phase, unexpected_phase);
-        
-    //     // print_bar(0, 8);
-    //     // print_sq(0, 16);
-    //     // print_cq(0, 4*31);
-
-    //     current_phase = command_base[3];
-    //     current_phase = ((current_phase >> 16) & 0x1);
+    // print current cqe 
+    // for (int i = 0; i < 4; i++) {
+    //     printf("DW[%d]: 0x%08x\n", i, command_base[i]);
     // }
 
     int status = command_base[3];
@@ -189,6 +132,169 @@ int wait_for_next_cqe(int ssd_id)
 
     return status;
 }
+
+/**
+ * IO 컴플리션 큐(CQ)에서 다음 CQE가 나올 때까지 대기 후
+ * CQ Head를 갱신하고, CQ Doorbell을 울린 뒤 status를 반환
+ */
+int wait_for_next_io_cqe(int ssd_id, int qid)
+{
+    // 현재 CQ Head
+    uint16_t head = io_cq_head[ssd_id][qid];
+    uint8_t phase = io_phase_bit[ssd_id][qid];
+
+    // CQ Head 인덱스에 해당하는 CQE의 시작 주소
+    // NVMe CQ Entry는 16바이트이므로, head * 16바이트 위치
+    volatile uint32_t *cqe_base =
+        (volatile uint32_t *)(SSD_IO_CQ_VIRT_BASE(ssd_id, qid) + (16 * head));
+
+    uint32_t *sq_base = (uint32_t *)(SSD_IO_SQ_VIRT_BASE(ssd_id, qid));
+    for (int i = 0; i < 16; i++) {
+        printf("SQ[%d]: 0x%08x\n", i, sq_base[i]);
+    }
+    // phase bit가 일치하는 동안은 아직 유효한 CQE가 아님
+    // CQE DWord3의 [16] 비트가 phase bit와 다를 때가 곧 valid completion
+    while (((cqe_base[3] >> 16) & 0x1) == phase) {
+        // 폴링
+        usleep(1);
+        for (int i = 0; i < 4; i++) {
+            printf("CQ[%d]: 0x%08x\n", i, cqe_base[i]);
+        }
+    }
+
+    // CQE에서 Status 뽑기 (DWord3의 [31:17]이 status, [16]이 phase bit)
+    int status = (cqe_base[3] >> 17);
+
+    // CQ Head 증가
+    uint16_t new_head = (head + 1) & (IO_QUEUE_DEPTH - 1); // queue_depth - 1 = 127 → 0x7F
+    io_cq_head[ssd_id][qid] = new_head;
+
+    // 만약 CQ Head가 0으로 돌아가면 phase bit를 반전
+    if (new_head == 0) {
+        io_phase_bit[ssd_id][qid] = !io_phase_bit[ssd_id][qid];
+    }
+
+    // Doorbell(CQ Head)에 new_head 반영
+    volatile uint32_t *cq_hdbell =
+        (uint32_t *)(ssd_virt_base[ssd_id] + 0x1000 + (2 * qid + 1) * 4);
+    *cq_hdbell = new_head;
+
+    return status;
+}
+
+/**
+ * IO 서브미션 큐(SQ)에 커맨드를 삽입.
+ *
+ * @param ssd_id  : SSD 식별자
+ * @param qid     : IO 큐 ID
+ * @param command : 16 DW(64바이트)로 구성된 NVMe IO Command
+ */
+void insert_io_sq(int ssd_id, int qid, const uint32_t command[16])
+{
+    // 현재 SQ Tail 위치를 확인
+    uint16_t tail = io_sq_tail[ssd_id][qid];
+
+    // SQ Tail 인덱스에 해당하는 실제 버퍼 주소 계산
+    volatile uint32_t *command_base =
+        (volatile uint32_t *)(SSD_IO_SQ_VIRT_BASE(ssd_id, qid) + (64 * tail));
+
+    // 명령어 16개 DW 복사
+    for (int i = 0; i < 16; i++) {
+        command_base[i] = command[i];
+    }
+
+    // SQ Tail 업데이트 (큐 깊이를 가정해서 마스크 연산)
+    // 예: 큐 깊이가 128이라면 (tail+1) & 0x7F
+    tail = (tail + 1) & (IO_QUEUE_DEPTH - 1);  // queue_depth - 1 = 127 → 0x7F
+    io_sq_tail[ssd_id][qid] = tail;
+
+    // Doorbell(Submission Queue Tail)에 Tail 값 반영
+    // NVMe spec에서 SQ0 doorbell offset = 0x1000, SQ1 doorbell offset = 0x1000 + (qid * 4) * 2^(dstrd)
+    // 질문 코드에서는 dstrd=0(4바이트 stride)라 하였고,
+    // 간단히 “SQ doorbell 레지스터가 SQ0: 0x1000, SQ1: 0x1004” 이런 식이 될 수 있음
+    // 하지만 질문 코드에선 QID=1이면 0x1000 + (qid*4) = 0x1004 로 갈 수도 있음
+    // 실제로는 CAP 레지스터에서 dstrd값을 따져서 doorbell offset을 계산해야 함.
+    // 여기서는 예시로 SQ1 doorbell = 0x1004 쪽을 사용한다고 가정:
+    volatile uint32_t *sq_tdbell =
+        (uint32_t *)(ssd_virt_base[ssd_id] + 0x1000 + (2 * qid) * 4); 
+    // printf("tail: %02x\n", tail);
+    *sq_tdbell = tail;
+}
+
+
+/**
+ * 간단히 NVM Read 명령(1블록)을 IO SQ에 넣고 CQE까지 기다림
+ *
+ * @param ssd_id     : SSD 식별자
+ * @param qid        : IO 큐 ID
+ * @param slba       : 시작 LBA (예: 0)
+ * @param nblocks    : 읽을 블록 수 (예: 1)
+ * @param prp1       : 데이터 수신용 버퍼의 물리주소
+ * @param nsid       : Namespace ID (주로 1)
+ * @return           : CQ에서의 Status Field (0이면 정상)
+ */
+int nvme_io_read(int ssd_id, int qid,
+    uint64_t slba, uint16_t nblocks,
+    uint64_t prp1, uint32_t nsid)
+{
+    // 새 command_id 할당
+    uint16_t cid = io_command_id[ssd_id][qid];
+    io_command_id[ssd_id][qid] = cid + 1;
+
+    // 16 DW 짜리 명령어 버퍼
+    uint32_t cmd[16];
+    memset(cmd, 0, sizeof(cmd));
+
+    // DW0
+    //  - [31:16] Command ID
+    //  - [7:0]   Opcode=0x02(Read)
+    cmd[0] = (cid << 16) | 0x02;
+
+    // DW1 = NSID
+    cmd[1] = nsid;
+
+    // DW6~7 = PRP1
+    cmd[6] = (uint32_t)(prp1 & 0xFFFFFFFF);
+    cmd[7] = (uint32_t)(prp1 >> 32);
+
+    // DW10 = [31:16] = NLB - 1 (nblocks - 1), [15:0] = 예약
+    cmd[10] = ((uint32_t)(nblocks - 1) << 16);
+
+    // DW12~13 = SLBA
+    cmd[12] = (uint32_t)(slba & 0xFFFFFFFF);
+    cmd[13] = (uint32_t)(slba >> 32);
+
+    // 명령어 SQ에 삽입
+    insert_io_sq(ssd_id, qid, cmd);
+
+    // CQE completion 대기
+    return wait_for_next_io_cqe(ssd_id, qid);
+}
+
+// Write Opcode = 0x01
+int nvme_io_write(int ssd_id, int qid,
+    uint64_t slba, uint16_t nblocks,
+    uint64_t prp1, uint32_t nsid)
+{
+    uint16_t cid = io_command_id[ssd_id][qid];
+    io_command_id[ssd_id][qid] = cid + 1;
+
+    uint32_t cmd[16];
+    memset(cmd, 0, sizeof(cmd));
+
+    // DW0 : CID + opcode=0x01
+    cmd[0] = (cid << 16) | 0x01;
+    cmd[1] = nsid;
+    cmd[6] = (uint32_t)(prp1 & 0xFFFFFFFF);
+    cmd[7] = (uint32_t)(prp1 >> 32);
+    cmd[10] = ((uint32_t)(nblocks - 1) << 16);
+    cmd[12] = (uint32_t)(slba & 0xFFFFFFFF);
+    cmd[13] = (uint32_t)(slba >> 32);
+
+    insert_io_sq(ssd_id, qid, cmd);
+    return wait_for_next_io_cqe(ssd_id, qid);
+}
+
 
 
 void insert_admin_sq(int ssd_id, uint32_t command[])
@@ -306,6 +412,10 @@ int nvme_create_sq(int ssd_id, uint16_t sq_id, uint16_t cq_id, uint16_t sq_depth
     {
         command[i] = 0;
     }    
+    // for (int i=0; i<16; i++)
+    // {
+    //     fprintf(stdout, "DW %2d: %08x\n", i, command[i]);
+    // }
     insert_admin_sq(ssd_id, command);
     return wait_for_next_cqe(ssd_id);
 }
@@ -616,9 +726,8 @@ int main(int argc, char **argv)
     }
 
     uint64_t cq_addr = SSD_IO_CQ_PHYS_BASE(0, 1);
-    printf("CQ address: 0x%lx\n", cq_addr);
     uint16_t qid = 1;
-    uint16_t queue_depth = 128;
+    uint16_t queue_depth = IO_QUEUE_DEPTH;
 
     cmd_ret = nvme_create_cq(0, qid, queue_depth, cq_addr);
     if (cmd_ret != 0) {
@@ -664,26 +773,41 @@ int main(int argc, char **argv)
     // Get temperature info
     printf("SSD Temperature: %u K (%d°C)\n", temperature_kelvin, temperature_celsius);
 
-    // // Set admin SQ tail doorbell
-    // virt_addr = (char *)map_base + base_offset;
-    // readval = *((volatile uint64_t *)virt_addr);
-    // printf("Read  value 0x%016lx from offset 0x%x\n", readval, base_offset);
+    {
+        uint64_t io_buf_phys = queue_phys_base + 0x10000;
+        uint8_t *io_buf_virt = (uint8_t *)(huge_base + 0x10000);
+    
+        // Write 테스트(1블록)
+        //  - LBA=0, nblocks=1, PRP=io_buf_phys, NSID=1
+        // 버퍼에 간단히 패턴 초기화 후 Write
+        memset(io_buf_virt, 0x5A, 4096);  // 4096바이트(1블록) 예시
+        int wstatus = nvme_io_write(0, 1, 0 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
+        if (wstatus != 0) {
+            fprintf(stderr, "IO Write command failed! status=0x%x\n", wstatus);
+        } else {
+            printf("IO Write success.\n");
+        }
+    
+        // 버퍼를 0으로 초기화
+        memset(io_buf_virt, 0, 4096);
+    
+        // Read 테스트(1블록)
+        int rstatus = nvme_io_read(0, 1, 0 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
+        if (rstatus != 0) {
+            fprintf(stderr, "IO Read command failed! status=0x%x\n", rstatus);
+        } else {
+            printf("IO Read success.\n");
+            // 실제로 io_buf_virt를 찍어보면 Write 때 넣었던 0x5A 패턴이 돌아와야 함
+            for (int i = 0; i < 16; i++) {
+                printf("%02X ", io_buf_virt[i]);
+            }
+            printf("\n");
+        }
+    }
 
-    // virt_addr = (char *)map_base + target_offset;
-
-    // readval = *((volatile uint64_t *)virt_addr);
-    // printf("Read  value 0x%016lx from offset 0x%x\n", readval, NVME_ADMIN_SUBMISSION_QUEUE_BASE_ADDR_OFFSET);
-
-    // *((volatile uint64_t *)virt_addr) = writeval;
-    // __sync_synchronize();  
-
-    // printf("Wrote value 0x%016lx to offset 0x%x\n", writeval, NVME_ADMIN_SUBMISSION_QUEUE_BASE_ADDR_OFFSET);
-    // readval = *((volatile uint64_t *)virt_addr);
-    // printf("Read  value 0x%016lx from offset 0x%x\n", readval, NVME_ADMIN_SUBMISSION_QUEUE_BASE_ADDR_OFFSET);
 
     munmap((void*)ssd_virt_base[0], MAP_SIZE);
     munmap(huge_base, HUGEPAGE_SIZE);
-    // munmap(buffer, HUGEPAGE_SIZE);
 
     return 0;
 }
