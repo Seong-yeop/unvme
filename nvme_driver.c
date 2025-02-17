@@ -36,7 +36,7 @@
 
 
 #define NVME_ADMIN_SUBMISSION_QUEUE_BASE_ADDR_OFFSET 0x28
-#define MAP_SIZE (1<<16)      // mapping할 영역의 크기 (예: 4K)
+#define MAP_SIZE (1<<16)      
 #define MAP_MASK (MAP_SIZE - 1)
 
 #define ADMIN_QUEUE_DEPTH 0x1F
@@ -97,12 +97,9 @@ void print_cq(int offset, int length) {
 
 int wait_for_next_cqe(int ssd_id)
 {
-    // Calculate the starting address of command.
     volatile uint32_t *command_base = (uint32_t *)(SSD_ADMIN_CQ_VIRT_BASE(ssd_id) + (16 * (admin_cq_hd[ssd_id] & ADMIN_QUEUE_DEPTH)));
 
     int unexpected_phase = phase_bit[ssd_id];
-    // printf("cq head: %02x, sq tail: %02x\n", admin_cq_hd[ssd_id], admin_sq_tl[ssd_id]);
-    // fprintf(stdout, "command base: %p, unexpected phase: %x, sq tail: %x\n", command_base, unexpected_phase, admin_sq_tl[0]);
     
     int current_phase;
     do {
@@ -120,31 +117,21 @@ int wait_for_next_cqe(int ssd_id)
 
     // Ring the doorbell.
     printf("admin_cq_hd: %02x\n", admin_cq_hd[ssd_id]);
-    // admin_cq_hd[ssd_id] = (admin_cq_hd[ssd_id] + 1) & ((ADMIN_QUEUE_DEPTH) |  (1 << 7));
     if (++admin_cq_hd[ssd_id] == (ADMIN_QUEUE_DEPTH + 1)) {
         admin_cq_hd[ssd_id] = 0;
         phase_bit[ssd_id] = !phase_bit[ssd_id];
     }
-    // admin_cq_hd[ssd_id] = (admin_cq_hd[ssd_id] + 1) & ADMIN_QUEUE_DEPTH;
     uint32_t *nvme_cq0hdbl_pt = (uint32_t *)(ssd_virt_base[ssd_id] + 0x1004);
     *nvme_cq0hdbl_pt = admin_cq_hd[ssd_id];
-    // printf("nvme_cq0hdbl_pt: %02x, admin_cq_hd: %02x\n", *nvme_cq0hdbl_pt, admin_cq_hd[ssd_id]);
 
     return status;
 }
 
-/**
- * IO 컴플리션 큐(CQ)에서 다음 CQE가 나올 때까지 대기 후
- * CQ Head를 갱신하고, CQ Doorbell을 울린 뒤 status를 반환
- */
 int wait_for_next_io_cqe(int ssd_id, int qid)
 {
-    // 현재 CQ Head
     uint16_t head = io_cq_head[ssd_id][qid];
     uint8_t phase = io_phase_bit[ssd_id][qid];
 
-    // CQ Head 인덱스에 해당하는 CQE의 시작 주소
-    // NVMe CQ Entry는 16바이트이므로, head * 16바이트 위치
     volatile uint32_t *cqe_base =
         (volatile uint32_t *)(SSD_IO_CQ_VIRT_BASE(ssd_id, qid) + (16 * head));
 
@@ -152,29 +139,22 @@ int wait_for_next_io_cqe(int ssd_id, int qid)
     for (int i = 0; i < 16; i++) {
         printf("SQ[%d]: 0x%08x\n", i, sq_base[i]);
     }
-    // phase bit가 일치하는 동안은 아직 유효한 CQE가 아님
-    // CQE DWord3의 [16] 비트가 phase bit와 다를 때가 곧 valid completion
     while (((cqe_base[3] >> 16) & 0x1) == phase) {
-        // 폴링
         usleep(1);
-        for (int i = 0; i < 4; i++) {
-            printf("CQ[%d]: 0x%08x\n", i, cqe_base[i]);
-        }
+        // for (int i = 0; i < 4; i++) {
+        //     printf("CQ[%d]: 0x%08x\n", i, cqe_base[i]);
+        // }
     }
 
-    // CQE에서 Status 뽑기 (DWord3의 [31:17]이 status, [16]이 phase bit)
     int status = (cqe_base[3] >> 17);
 
-    // CQ Head 증가
-    uint16_t new_head = (head + 1) & (IO_QUEUE_DEPTH - 1); // queue_depth - 1 = 127 → 0x7F
+    uint16_t new_head = (head + 1) & (IO_QUEUE_DEPTH - 1); 
     io_cq_head[ssd_id][qid] = new_head;
 
-    // 만약 CQ Head가 0으로 돌아가면 phase bit를 반전
     if (new_head == 0) {
         io_phase_bit[ssd_id][qid] = !io_phase_bit[ssd_id][qid];
     }
 
-    // Doorbell(CQ Head)에 new_head 반영
     volatile uint32_t *cq_hdbell =
         (uint32_t *)(ssd_virt_base[ssd_id] + 0x1000 + (2 * qid + 1) * 4);
     *cq_hdbell = new_head;
@@ -183,65 +163,50 @@ int wait_for_next_io_cqe(int ssd_id, int qid)
 }
 
 /**
- * IO 서브미션 큐(SQ)에 커맨드를 삽입.
+ * Insert a command to the IO submission queue.
  *
- * @param ssd_id  : SSD 식별자
- * @param qid     : IO 큐 ID
- * @param command : 16 DW(64바이트)로 구성된 NVMe IO Command
+ * @param ssd_id  : SSD ID
+ * @param qid     : IO Queue ID
+ * @param command : 16 DW command
  */
 void insert_io_sq(int ssd_id, int qid, const uint32_t command[16])
 {
-    // 현재 SQ Tail 위치를 확인
     uint16_t tail = io_sq_tail[ssd_id][qid];
 
-    // SQ Tail 인덱스에 해당하는 실제 버퍼 주소 계산
     volatile uint32_t *command_base =
         (volatile uint32_t *)(SSD_IO_SQ_VIRT_BASE(ssd_id, qid) + (64 * tail));
 
-    // 명령어 16개 DW 복사
     for (int i = 0; i < 16; i++) {
         command_base[i] = command[i];
     }
 
-    // SQ Tail 업데이트 (큐 깊이를 가정해서 마스크 연산)
-    // 예: 큐 깊이가 128이라면 (tail+1) & 0x7F
-    tail = (tail + 1) & (IO_QUEUE_DEPTH - 1);  // queue_depth - 1 = 127 → 0x7F
+    tail = (tail + 1) & (IO_QUEUE_DEPTH - 1);  
     io_sq_tail[ssd_id][qid] = tail;
 
-    // Doorbell(Submission Queue Tail)에 Tail 값 반영
-    // NVMe spec에서 SQ0 doorbell offset = 0x1000, SQ1 doorbell offset = 0x1000 + (qid * 4) * 2^(dstrd)
-    // 질문 코드에서는 dstrd=0(4바이트 stride)라 하였고,
-    // 간단히 “SQ doorbell 레지스터가 SQ0: 0x1000, SQ1: 0x1004” 이런 식이 될 수 있음
-    // 하지만 질문 코드에선 QID=1이면 0x1000 + (qid*4) = 0x1004 로 갈 수도 있음
-    // 실제로는 CAP 레지스터에서 dstrd값을 따져서 doorbell offset을 계산해야 함.
-    // 여기서는 예시로 SQ1 doorbell = 0x1004 쪽을 사용한다고 가정:
     volatile uint32_t *sq_tdbell =
         (uint32_t *)(ssd_virt_base[ssd_id] + 0x1000 + (2 * qid) * 4); 
-    // printf("tail: %02x\n", tail);
     *sq_tdbell = tail;
 }
 
 
 /**
- * 간단히 NVM Read 명령(1블록)을 IO SQ에 넣고 CQE까지 기다림
+ * Insert a simple NVM Read command (1 block) into the IO SQ and wait for the CQE
  *
- * @param ssd_id     : SSD 식별자
- * @param qid        : IO 큐 ID
- * @param slba       : 시작 LBA (예: 0)
- * @param nblocks    : 읽을 블록 수 (예: 1)
- * @param prp1       : 데이터 수신용 버퍼의 물리주소
- * @param nsid       : Namespace ID (주로 1)
- * @return           : CQ에서의 Status Field (0이면 정상)
+ * @param ssd_id     : SSD identifier
+ * @param qid        : IO queue ID
+ * @param slba       : Starting LBA (e.g., 0)
+ * @param nblocks    : Number of blocks to read (e.g., 1)
+ * @param prp1       : Physical address of the buffer to receive data
+ * @param nsid       : Namespace ID (usually 1)
+ * @return           : Status Field from the CQ (0 if successful)
  */
 int nvme_io_read(int ssd_id, int qid,
     uint64_t slba, uint16_t nblocks,
     uint64_t prp1, uint32_t nsid)
 {
-    // 새 command_id 할당
     uint16_t cid = io_command_id[ssd_id][qid];
     io_command_id[ssd_id][qid] = cid + 1;
 
-    // 16 DW 짜리 명령어 버퍼
     uint32_t cmd[16];
     memset(cmd, 0, sizeof(cmd));
 
@@ -257,17 +222,15 @@ int nvme_io_read(int ssd_id, int qid,
     cmd[6] = (uint32_t)(prp1 & 0xFFFFFFFF);
     cmd[7] = (uint32_t)(prp1 >> 32);
 
-    // DW10 = [31:16] = NLB - 1 (nblocks - 1), [15:0] = 예약
+    // DW10 = [31:16] = NLB - 1 (nblocks - 1), [15:0] = reserved
     cmd[10] = ((uint32_t)(nblocks - 1) << 16);
 
     // DW12~13 = SLBA
     cmd[12] = (uint32_t)(slba & 0xFFFFFFFF);
     cmd[13] = (uint32_t)(slba >> 32);
 
-    // 명령어 SQ에 삽입
     insert_io_sq(ssd_id, qid, cmd);
 
-    // CQE completion 대기
     return wait_for_next_io_cqe(ssd_id, qid);
 }
 
@@ -299,11 +262,9 @@ int nvme_io_write(int ssd_id, int qid,
 
 void insert_admin_sq(int ssd_id, uint32_t command[])
 {
-    printf("Inserting command to admin SQ\n");
-    // Calculate the starting address of command.
+    // printf("Inserting command to admin SQ\n");
     volatile uint32_t *command_base = (uint32_t *)(SSD_ADMIN_SQ_VIRT_BASE(ssd_id) + (64 * admin_sq_tl[ssd_id]));
 
-    // Fill in the command.
     for (int i=0; i<16; i++)
     {
         command_base[i] = command[i];
@@ -314,7 +275,6 @@ void insert_admin_sq(int ssd_id, uint32_t command[])
     admin_sq_tl[ssd_id] = (admin_sq_tl[ssd_id] + 1) & ADMIN_QUEUE_DEPTH;
     volatile uint32_t *nvme_sq0tdbl_pt = (uint32_t *)(ssd_virt_base[ssd_id] + 0x1000);
     *nvme_sq0tdbl_pt = admin_sq_tl[ssd_id];
-    // printf("nvme_sq0tdbl_pt: %02x, admin_sq_tl: %02x\n", *nvme_sq0tdbl_pt, admin_sq_tl[ssd_id]);
     return;
 }
 
@@ -492,23 +452,14 @@ int get_temperature_info(int ssd_id, uint64_t phys_addr)
 }
 
 /**
- * Identify Controller 명령을 보내고, 결과를 버퍼(phys_addr)에 수신
+ * Send Identify Controller command and receive the result in the buffer (phys_addr)
  *
- * @param ssd_id     : 여러 디바이스 중 몇 번 SSD인지 구분
- * @param phys_addr  : Identify 결과를 수신할 물리 버퍼 주소 (PRP1로 사용)
- * @return           : CQ의 Status Field (오류 시 0이 아닌 값이 들어올 수 있음)
+ * @param ssd_id     : SSD identifier among multiple devices
+ * @param phys_addr  : Physical buffer address to receive Identify result (used as PRP1)
+ * @return           : Status Field from the CQ (non-zero value indicates an error)
  */
 int nvme_identify_controller(int ssd_id, uint64_t phys_addr)
 {
-    /**
-     * NVMe Command 형식 (16개 DW)
-     *  - DW0 : [31:16] Command ID, [9:8] Fuse, [7:0] Opcode
-     *  - DW1 : Namespace ID (Identify Controller 시 보통 0 또는 0xffffffff)
-     *  - DW6~7 : PRP1 (하위 64비트)
-     *  - DW8~9 : PRP2 (Identify 구조체가 4KB 이내면 보통 사용 안 함 = 0)
-     *  - DW10 : [7:0] CNS (Identify 하위 명령), (CNS=1 → Identify Controller)
-     *  - ...
-     */
 
     uint32_t command[16];
     memset(command, 0, sizeof(command));
