@@ -15,7 +15,7 @@
 
 #define HUGEPAGE_SIZE (2 * 1024 * 1024)
 #define HUGEPAGE_FILE "/sys/kernel/hugepage_info/hugepage_phys"
-#define NVME_RESOURCE_FILE "/sys/bus/pci/devices/0000:af:00.0/resource"
+#define NVME_RESOURCE_FILE "/sys/bus/pci/devices/0000:18:00.0/resource"
 
 #define SSD_ADMIN_SQ_PHYS_BASE(ssd_id) ((queue_phys_base) + 0x2000 * (ssd_id))
 #define SSD_ADMIN_CQ_PHYS_BASE(ssd_id) ((queue_phys_base) + 0x2000 * (ssd_id) + 0x1000)
@@ -204,56 +204,104 @@ int nvme_io_read(int ssd_id, int qid,
     uint64_t slba, uint16_t nblocks,
     uint64_t prp1, uint32_t nsid)
 {
+    // 명령 ID 설정
     uint16_t cid = io_command_id[ssd_id][qid];
     io_command_id[ssd_id][qid] = cid + 1;
 
+    // NVMe 명령 16 DWord를 0으로 초기화
     uint32_t cmd[16];
     memset(cmd, 0, sizeof(cmd));
 
+    // -----------------------------------------------------------------
     // DW0
-    //  - [31:16] Command ID
-    //  - [7:0]   Opcode=0x02(Read)
+    //   [31:16] = Command ID
+    //   [7:0]   = Opcode (0x02 = Read)
+    // -----------------------------------------------------------------
     cmd[0] = (cid << 16) | 0x02;
 
-    // DW1 = NSID
+    // DW1 = Namespace ID
     cmd[1] = nsid;
 
-    // DW6~7 = PRP1
+    // -----------------------------------------------------------------
+    // DW6 ~ DW7 = PRP1 (데이터 버퍼 주소)
+    //   - 하위 32비트, 상위 32비트 순서
+    // -----------------------------------------------------------------
     cmd[6] = (uint32_t)(prp1 & 0xFFFFFFFF);
     cmd[7] = (uint32_t)(prp1 >> 32);
 
-    // DW10 = [31:16] = NLB - 1 (nblocks - 1), [15:0] = reserved
-    cmd[10] = ((uint32_t)(nblocks - 1) << 16);
+    // -----------------------------------------------------------------
+    // DW10, DW11 = SLBA(Start LBA, 64비트)
+    //   - DW10 = SLBA 하위 32비트
+    //   - DW11 = SLBA 상위 32비트
+    // -----------------------------------------------------------------
+    cmd[10] = (uint32_t)(slba & 0xFFFFFFFF);
+    cmd[11] = (uint32_t)(slba >> 32);
 
-    // DW12~13 = SLBA
-    cmd[12] = (uint32_t)(slba & 0xFFFFFFFF);
-    cmd[13] = (uint32_t)(slba >> 32);
+    // -----------------------------------------------------------------
+    // DW12 = [15:0] = (NLB - 1)
+    //        [31:16] = 0(Reserved)
+    // -----------------------------------------------------------------
+    cmd[12] = (uint32_t)((nblocks - 1) & 0xFFFF);
 
+    // DW13~DW15: 필요한 경우가 없으면 그대로 0 유지
+    // (이미 memset으로 0 초기화됨)
+
+    // 만든 명령을 I/O 서브미션 큐에 삽입
     insert_io_sq(ssd_id, qid, cmd);
 
+    // 명령 완료를 기다리고 결과(Completion Queue Entry) 확인
     return wait_for_next_io_cqe(ssd_id, qid);
 }
+
 
 // Write Opcode = 0x01
 int nvme_io_write(int ssd_id, int qid,
     uint64_t slba, uint16_t nblocks,
     uint64_t prp1, uint32_t nsid)
 {
+    // Command ID 할당
     uint16_t cid = io_command_id[ssd_id][qid];
     io_command_id[ssd_id][qid] = cid + 1;
 
+    // NVMe 명령 DWord 16개 (64바이트) 초기화
     uint32_t cmd[16];
     memset(cmd, 0, sizeof(cmd));
 
-    // DW0 : CID + opcode=0x01
+    //--------------------------------------------------------------------------
+    // DW0 : [31:16] = CID, [7:0] = Opcode (0x01 = Write)
+    //--------------------------------------------------------------------------
     cmd[0] = (cid << 16) | 0x01;
+
+    // DW1 : NSID
     cmd[1] = nsid;
+
+    //--------------------------------------------------------------------------
+    // DW6 ~ DW7 : PRP1 (버퍼 주소, 64비트)
+    //   - DW6 = 하위 32비트
+    //   - DW7 = 상위 32비트
+    //--------------------------------------------------------------------------
     cmd[6] = (uint32_t)(prp1 & 0xFFFFFFFF);
     cmd[7] = (uint32_t)(prp1 >> 32);
-    cmd[10] = ((uint32_t)(nblocks - 1) << 16);
-    cmd[12] = (uint32_t)(slba & 0xFFFFFFFF);
-    cmd[13] = (uint32_t)(slba >> 32);
 
+    //--------------------------------------------------------------------------
+    // DW10 ~ DW11 : SLBA (시작 LBA, 64비트)
+    //   - DW10 = SLBA 하위 32비트
+    //   - DW11 = SLBA 상위 32비트
+    //--------------------------------------------------------------------------
+    cmd[10] = (uint32_t)(slba & 0xFFFFFFFF);
+    cmd[11] = (uint32_t)(slba >> 32);
+
+    //--------------------------------------------------------------------------
+    // DW12 : [15:0] = NLB - 1
+    //        [31:16] = 예약 / 필요시 FUA, PRINFO 등
+    //--------------------------------------------------------------------------
+    cmd[12] = (uint32_t)((nblocks - 1) & 0xFFFF);
+
+    // 나머지 DW13 ~ DW15는 0으로 둠 (이미 memset)
+
+    //--------------------------------------------------------------------------
+    // 제출 큐에 명령어 삽입 및 완료 대기
+    //--------------------------------------------------------------------------
     insert_io_sq(ssd_id, qid, cmd);
     return wait_for_next_io_cqe(ssd_id, qid);
 }
@@ -731,8 +779,8 @@ int main(int argc, char **argv)
         // Write 테스트(1블록)
         //  - LBA=0, nblocks=1, PRP=io_buf_phys, NSID=1
         // 버퍼에 간단히 패턴 초기화 후 Write
-        memset(io_buf_virt, 0x5A, 4096);  // 4096바이트(1블록) 예시
-        int wstatus = nvme_io_write(0, 1, 0 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
+        memset(io_buf_virt, 0x36, 4096);  // 4096바이트(1블록) 예시
+        int wstatus = nvme_io_write(0, 1, 10 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
         if (wstatus != 0) {
             fprintf(stderr, "IO Write command failed! status=0x%x\n", wstatus);
         } else {
@@ -743,7 +791,7 @@ int main(int argc, char **argv)
         memset(io_buf_virt, 0, 4096);
     
         // Read 테스트(1블록)
-        int rstatus = nvme_io_read(0, 1, 0 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
+        int rstatus = nvme_io_read(0, 1, 10 /*slba*/, 1 /*nblocks*/, io_buf_phys, 1 /*nsid*/);
         if (rstatus != 0) {
             fprintf(stderr, "IO Read command failed! status=0x%x\n", rstatus);
         } else {
